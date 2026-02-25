@@ -1,0 +1,27 @@
+{
+  "version": "2.0",
+  "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "maxTelemetryItemsPerSecond": 20
+      }
+    },
+    "logLevel": {
+      "default": "Information",
+      "Host.Results": "Warning",
+      "Function": "Information",
+      "Host.Aggregator": "Trace"
+    }
+  },
+  "extensions": {
+    "durableTask": {
+      "hubName": "OrderProcessingHub",
+      "storageProvider": {
+        "type": "AzureStorage"
+      },
+      "maxConcurrentActivityFunctions": 10,
+      "maxConcurrentOrchestratorFunctions": 10
+    }
+  }
+}
