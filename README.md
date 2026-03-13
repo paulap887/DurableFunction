@@ -1,4 +1,4 @@
-# Order Processing — Azure Durable Functions
+# Azure Durable Functions
 
 A working example of an Azure Durable Functions order processing workflow built with .NET 9 and the isolated worker model. Covers the full orchestration pattern: HTTP trigger → orchestrator → activity functions → status polling.
 
