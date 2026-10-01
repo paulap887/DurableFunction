@@ -53,3 +53,9 @@ __pycache__/
 # Node
 node_modules/
 dist/
+
+# Azurite local storage
+azurite/
+
+# BenchmarkDotNet / test results
+TestResults/
