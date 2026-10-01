@@ -26,7 +26,10 @@ public enum OrderStatus
     PaymentProcessed,
     EmailSent,
     Completed,
-    Failed
+    Failed,
+    // Appended so existing numeric values (e.g. Completed = 4) do not change.
+    InventoryReserved,
+    Cancelled
 }
 
 public class OrderResult
@@ -34,4 +37,7 @@ public class OrderResult
     public bool Success { get; set; }
     public string Message { get; set; } = string.Empty;
     public Order? Order { get; set; }
+
+    public static OrderResult Ok(string message, Order? order = null) => new() { Success = true, Message = message, Order = order };
+    public static OrderResult Fail(string message, Order? order = null) => new() { Success = false, Message = message, Order = order };
 }
