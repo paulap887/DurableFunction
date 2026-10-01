@@ -1,164 +1,119 @@
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 using OrderProcessing.Models;
+using OrderProcessing.Services;
 
 namespace OrderProcessing.Functions;
 
-public class OrderActivities
+/// <summary>
+/// Activities return <see cref="OrderResult"/> with Success = false for business outcomes (invalid order, out of stock,
+/// card declined), which retrying would not change. They let transient failures throw, so the orchestrator's retry
+/// policy can handle them. Catching every exception and returning Success = false would make retries impossible.
+/// </summary>
+public class OrderActivities(
+    ILogger<OrderActivities> logger,
+    IPaymentGateway paymentGateway,
+    IInventoryService inventory)
 {
-    private readonly ILogger<OrderActivities> _logger;
-
-    public OrderActivities(ILogger<OrderActivities> logger)
-    {
-        _logger = logger;
-    }
-
     [Function(nameof(ValidateOrder))]
     public OrderResult ValidateOrder([ActivityTrigger] Order order)
     {
-        _logger.LogInformation($"Validating order: {order.OrderId}");
+        logger.LogInformation("Validating order {OrderId}", order.OrderId);
 
-        // Validate customer information
         if (string.IsNullOrWhiteSpace(order.CustomerName))
-        {
-            return new OrderResult
-            {
-                Success = false,
-                Message = "Customer name is required"
-            };
-        }
+            return OrderResult.Fail("Customer name is required");
 
-        if (string.IsNullOrWhiteSpace(order.CustomerEmail) || !order.CustomerEmail.Contains("@"))
-        {
-            return new OrderResult
-            {
-                Success = false,
-                Message = "Valid customer email is required"
-            };
-        }
+        if (string.IsNullOrWhiteSpace(order.CustomerEmail) || !order.CustomerEmail.Contains('@'))
+            return OrderResult.Fail("Valid customer email is required");
 
-        // Validate order items
         if (order.Items == null || order.Items.Count == 0)
-        {
-            return new OrderResult
-            {
-                Success = false,
-                Message = "Order must contain at least one item"
-            };
-        }
+            return OrderResult.Fail("Order must contain at least one item");
 
-        // Validate total amount
+        if (order.Items.Any(item => item.Quantity <= 0 || item.Price < 0))
+            return OrderResult.Fail("Invalid item quantity or price");
+
         decimal calculatedTotal = order.Items.Sum(item => item.Price * item.Quantity);
         if (Math.Abs(order.TotalAmount - calculatedTotal) > 0.01m)
+            return OrderResult.Fail($"Order total mismatch. Expected: {calculatedTotal}, Got: {order.TotalAmount}");
+
+        logger.LogInformation("Order {OrderId} validated", order.OrderId);
+        return OrderResult.Ok("Order validation successful");
+    }
+
+    [Function(nameof(ReserveInventory))]
+    public OrderResult ReserveInventory([ActivityTrigger] Order order)
+    {
+        if (!inventory.TryReserve(order.OrderId, order.Items, out var reason))
         {
-            return new OrderResult
-            {
-                Success = false,
-                Message = $"Order total mismatch. Expected: {calculatedTotal}, Got: {order.TotalAmount}"
-            };
+            logger.LogWarning("Inventory reservation failed for order {OrderId}: {Reason}", order.OrderId, reason);
+            return OrderResult.Fail(reason);
         }
 
-        // Check for negative quantities or prices
-        if (order.Items.Any(item => item.Quantity <= 0 || item.Price < 0))
-        {
-            return new OrderResult
-            {
-                Success = false,
-                Message = "Invalid item quantity or price"
-            };
-        }
+        logger.LogInformation("Inventory reserved for order {OrderId}", order.OrderId);
+        return OrderResult.Ok("Inventory reserved");
+    }
 
-        _logger.LogInformation($"Order {order.OrderId} validated successfully");
-        return new OrderResult
-        {
-            Success = true,
-            Message = "Order validation successful"
-        };
+    /// <summary>Compensation for <see cref="ReserveInventory"/>. Idempotent, so it is safe to retry.</summary>
+    [Function(nameof(ReleaseInventory))]
+    public void ReleaseInventory([ActivityTrigger] Order order)
+    {
+        inventory.Release(order.OrderId);
+        logger.LogInformation("Compensation: released inventory for order {OrderId}", order.OrderId);
     }
 
     [Function(nameof(ProcessPayment))]
     public async Task<OrderResult> ProcessPayment([ActivityTrigger] Order order)
     {
-        _logger.LogInformation($"Processing payment for order: {order.OrderId}, Amount: ${order.TotalAmount}");
+        logger.LogInformation("Processing payment for order {OrderId}, amount {Amount}", order.OrderId, order.TotalAmount);
 
-        try
+        // The order id is the idempotency key: if a previous attempt charged the card and then timed out,
+        // the retry gets the original result instead of charging twice.
+        // PaymentGatewayUnavailableException is deliberately not caught.
+        var outcome = await paymentGateway.ChargeAsync(order.OrderId, order.TotalAmount);
+
+        if (!outcome.Approved)
         {
-            // Simulate payment processing delay
-            await Task.Delay(2000);
-
-            // In a real-world scenario, you would integrate with a payment gateway like Stripe, PayPal, etc.
-            // For this example, we'll simulate a successful payment
-
-            // Simulate random payment failures for demonstration (10% failure rate)
-            Random random = new Random();
-            if (random.Next(100) < 10)
-            {
-                _logger.LogWarning($"Payment declined for order {order.OrderId}");
-                return new OrderResult
-                {
-                    Success = false,
-                    Message = "Payment was declined by the payment processor"
-                };
-            }
-
-            _logger.LogInformation($"Payment processed successfully for order {order.OrderId}");
-            return new OrderResult
-            {
-                Success = true,
-                Message = $"Payment of ${order.TotalAmount} processed successfully"
-            };
+            logger.LogWarning("Payment declined for order {OrderId}: {Message}", order.OrderId, outcome.Message);
+            return OrderResult.Fail(outcome.Message);
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, $"Error processing payment for order {order.OrderId}");
-            return new OrderResult
-            {
-                Success = false,
-                Message = $"Payment processing error: {ex.Message}"
-            };
-        }
+
+        logger.LogInformation("Payment approved for order {OrderId}, transaction {TransactionId}", order.OrderId, outcome.TransactionId);
+        return OrderResult.Ok(outcome.Message);
+    }
+
+    /// <summary>
+    /// Compensation for <see cref="ProcessPayment"/> when its outcome is unknown: a charge can succeed and then time out,
+    /// so "payment failed after all retries" does not mean the customer was not charged. Idempotent, so it is safe to retry.
+    /// </summary>
+    [Function(nameof(RefundPayment))]
+    public async Task RefundPayment([ActivityTrigger] Order order)
+    {
+        var refunded = await paymentGateway.RefundAsync(order.OrderId);
+        logger.LogInformation(refunded
+            ? "Compensation: refunded payment for order {OrderId}"
+            : "Compensation: no charge to refund for order {OrderId}", order.OrderId);
     }
 
     [Function(nameof(SendConfirmationEmail))]
     public async Task<OrderResult> SendConfirmationEmail([ActivityTrigger] Order order)
     {
-        _logger.LogInformation($"Sending confirmation email to {order.CustomerEmail} for order {order.OrderId}");
+        logger.LogInformation("Sending confirmation email to {Email} for order {OrderId}", order.CustomerEmail, order.OrderId);
 
-        try
-        {
-            // Simulate email sending delay
-            await Task.Delay(1000);
+        // Simulate email sending delay.
+        // In a real-world scenario, you would use SendGrid, Azure Communication Services, or similar,
+        // and let its exceptions propagate so the orchestrator's retry policy applies.
+        await Task.Delay(1000);
 
-            // In a real-world scenario, you would use SendGrid, Azure Communication Services, or similar
-            // For this example, we'll just log the email content
+        string emailSubject = $"Order Confirmation - {order.OrderId}";
+        string emailBody = BuildEmailBody(order);
 
-            string emailSubject = $"Order Confirmation - {order.OrderId}";
-            string emailBody = BuildEmailBody(order);
+        logger.LogInformation("Email would be sent with subject: {Subject}", emailSubject);
+        logger.LogInformation("Email body:\n{Body}", emailBody);
 
-            _logger.LogInformation($"Email would be sent with subject: {emailSubject}");
-            _logger.LogInformation($"Email body:\n{emailBody}");
-
-            // Simulate successful email sending
-            _logger.LogInformation($"Confirmation email sent successfully to {order.CustomerEmail}");
-
-            return new OrderResult
-            {
-                Success = true,
-                Message = "Confirmation email sent successfully"
-            };
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, $"Error sending email for order {order.OrderId}");
-            return new OrderResult
-            {
-                Success = false,
-                Message = $"Email sending error: {ex.Message}"
-            };
-        }
+        return OrderResult.Ok("Confirmation email sent successfully");
     }
 
-    private string BuildEmailBody(Order order)
+    private static string BuildEmailBody(Order order)
     {
         var itemsList = string.Join("\n", order.Items.Select(item =>
             $"  - {item.ProductName} (x{item.Quantity}) - ${item.Price * item.Quantity}"));

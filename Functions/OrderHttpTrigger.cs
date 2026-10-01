@@ -104,6 +104,7 @@ public class OrderHttpTrigger
             {
                 instanceId = metadata.InstanceId,
                 runtimeStatus = metadata.RuntimeStatus.ToString(),
+                customStatus = metadata.ReadCustomStatusAs<object>(),
                 createdTime = metadata.CreatedAt,
                 lastUpdatedTime = metadata.LastUpdatedAt,
                 output = metadata.ReadOutputAs<OrderResult>()

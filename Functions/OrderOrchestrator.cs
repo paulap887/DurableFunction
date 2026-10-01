@@ -5,8 +5,31 @@ using OrderProcessing.Models;
 
 namespace OrderProcessing.Functions;
 
+/// <summary>
+/// Saga: Validate -> ReserveInventory -> ProcessPayment -> SendConfirmationEmail.
+/// If payment is declined, the inventory reservation is compensated (released). If payment keeps failing, its outcome
+/// is unknown (a charge can succeed and then time out), so the payment is refunded as well.
+/// </summary>
 public class OrderOrchestrator
 {
+    // Transient failures (the activity throws) are retried with exponential backoff: 2s, 4s, 8s.
+    // Business outcomes (the activity returns Success = false) are not retried.
+    public static readonly TaskOptions PaymentRetry = TaskOptions.FromRetryPolicy(new RetryPolicy(
+        maxNumberOfAttempts: 4,
+        firstRetryInterval: TimeSpan.FromSeconds(2),
+        backoffCoefficient: 2.0));
+
+    public static readonly TaskOptions EmailRetry = TaskOptions.FromRetryPolicy(new RetryPolicy(
+        maxNumberOfAttempts: 3,
+        firstRetryInterval: TimeSpan.FromSeconds(5)));
+
+    // Compensation must eventually succeed, so it gets the most patient policy.
+    public static readonly TaskOptions CompensationRetry = TaskOptions.FromRetryPolicy(new RetryPolicy(
+        maxNumberOfAttempts: 10,
+        firstRetryInterval: TimeSpan.FromSeconds(5),
+        backoffCoefficient: 2.0,
+        maxRetryInterval: TimeSpan.FromMinutes(5)));
+
     [Function(nameof(RunOrderOrchestration))]
     public async Task<OrderResult> RunOrderOrchestration(
         [OrchestrationTrigger] TaskOrchestrationContext context)
@@ -14,89 +37,71 @@ public class OrderOrchestrator
         ILogger logger = context.CreateReplaySafeLogger(nameof(OrderOrchestrator));
 
         var order = context.GetInput<Order>()!;
-        logger.LogInformation($"Starting order orchestration for Order ID: {order.OrderId}");
+        logger.LogInformation("Starting order orchestration for order {OrderId}", order.OrderId);
 
+        // Step 1: Validate the order
+        context.SetCustomStatus(new { step = "Validating" });
+        var validationResult = await context.CallActivityAsync<OrderResult>(nameof(OrderActivities.ValidateOrder), order);
+        if (!validationResult.Success)
+            return Finish(logger, order, OrderStatus.Failed, validationResult.Message);
+        order.Status = OrderStatus.Validated;
+
+        // Step 2: Reserve inventory
+        context.SetCustomStatus(new { step = "ReservingInventory" });
+        var reservation = await context.CallActivityAsync<OrderResult>(nameof(OrderActivities.ReserveInventory), order);
+        if (!reservation.Success)
+            return Finish(logger, order, OrderStatus.Failed, reservation.Message);
+        order.Status = OrderStatus.InventoryReserved;
+
+        // Step 3: Process payment (retried on transient failures, compensated if it does not succeed)
+        context.SetCustomStatus(new { step = "ProcessingPayment" });
+        OrderResult paymentResult;
         try
         {
-            // Step 1: Validate the order
-            logger.LogInformation("Step 1: Validating order");
-            var validationResult = await context.CallActivityAsync<OrderResult>(
-                nameof(OrderActivities.ValidateOrder),
-                order);
-
-            if (!validationResult.Success)
-            {
-                logger.LogWarning($"Order validation failed: {validationResult.Message}");
-                return new OrderResult
-                {
-                    Success = false,
-                    Message = validationResult.Message,
-                    Order = order
-                };
-            }
-
-            order.Status = OrderStatus.Validated;
-            logger.LogInformation("Order validated successfully");
-
-            // Step 2: Process payment
-            logger.LogInformation("Step 2: Processing payment");
-            var paymentResult = await context.CallActivityAsync<OrderResult>(
-                nameof(OrderActivities.ProcessPayment),
-                order);
-
-            if (!paymentResult.Success)
-            {
-                logger.LogWarning($"Payment processing failed: {paymentResult.Message}");
-                return new OrderResult
-                {
-                    Success = false,
-                    Message = paymentResult.Message,
-                    Order = order
-                };
-            }
-
-            order.Status = OrderStatus.PaymentProcessed;
-            logger.LogInformation("Payment processed successfully");
-
-            // Step 3: Send confirmation email
-            logger.LogInformation("Step 3: Sending confirmation email");
-            var emailResult = await context.CallActivityAsync<OrderResult>(
-                nameof(OrderActivities.SendConfirmationEmail),
-                order);
-
-            if (!emailResult.Success)
-            {
-                logger.LogWarning($"Email sending failed: {emailResult.Message}");
-                // Don't fail the entire order if email fails
-                order.Status = OrderStatus.Completed;
-                return new OrderResult
-                {
-                    Success = true,
-                    Message = "Order completed but email notification failed",
-                    Order = order
-                };
-            }
-
-            order.Status = OrderStatus.Completed;
-            logger.LogInformation($"Order orchestration completed successfully for Order ID: {order.OrderId}");
-
-            return new OrderResult
-            {
-                Success = true,
-                Message = "Order processed successfully",
-                Order = order
-            };
+            paymentResult = await context.CallActivityAsync<OrderResult>(nameof(OrderActivities.ProcessPayment), order, PaymentRetry);
         }
-        catch (Exception ex)
+        catch (TaskFailedException ex)
         {
-            logger.LogError(ex, $"Error processing order {order.OrderId}");
-            order.Status = OrderStatus.Failed;
-            return new OrderResult
-            {
-                Success = false,
-                Message = $"Order processing failed: {ex.Message}",
-                Order = order
-            };
+            logger.LogError("Payment for order {OrderId} failed after all retries: {Error}", order.OrderId, ex.FailureDetails.ErrorMessage);
+            await CompensateAsync(context, order, refundPayment: true);
+            return Finish(logger, order, OrderStatus.Cancelled, $"Payment service unavailable, order cancelled: {ex.FailureDetails.ErrorMessage}");
         }
+
+        if (!paymentResult.Success)
+        {
+            await CompensateAsync(context, order, refundPayment: false); // declined: nothing was charged
+            return Finish(logger, order, OrderStatus.Cancelled, paymentResult.Message);
+        }
+        order.Status = OrderStatus.PaymentProcessed;
+
+        // Step 4: Send confirmation email. The order is already paid, so an email failure must not undo it.
+        context.SetCustomStatus(new { step = "SendingConfirmation" });
+        try
+        {
+            await context.CallActivityAsync<OrderResult>(nameof(OrderActivities.SendConfirmationEmail), order, EmailRetry);
+        }
+        catch (TaskFailedException ex)
+        {
+            logger.LogWarning("Confirmation email for order {OrderId} failed after all retries: {Error}", order.OrderId, ex.FailureDetails.ErrorMessage);
+            return Finish(logger, order, OrderStatus.Completed, "Order completed but email notification failed", success: true);
+        }
+
+        return Finish(logger, order, OrderStatus.Completed, "Order processed successfully", success: true);
+    }
+
+    /// <summary>Undoes completed steps in reverse order.</summary>
+    private static async Task CompensateAsync(TaskOrchestrationContext context, Order order, bool refundPayment)
+    {
+        context.SetCustomStatus(new { step = "Compensating" });
+        if (refundPayment)
+            await context.CallActivityAsync(nameof(OrderActivities.RefundPayment), order, CompensationRetry);
+        await context.CallActivityAsync(nameof(OrderActivities.ReleaseInventory), order, CompensationRetry);
+    }
+
+    private static OrderResult Finish(ILogger logger, Order order, OrderStatus status, string message, bool success = false)
+    {
+        order.Status = status;
+        logger.LogInformation("Order {OrderId} finished with status {Status}: {Message}", order.OrderId, status, message);
+        return new OrderResult { Success = success, Message = message, Order = order };
     }
 }
